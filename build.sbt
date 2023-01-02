@@ -1,6 +1,4 @@
 Global / excludeLintKeys += logManager
-Global / excludeLintKeys += scalaJSUseMainModuleInitializer
-Global / excludeLintKeys += scalaJSLinkerConfig
 
 inThisBuild(
   List(
@@ -51,8 +49,12 @@ lazy val munitSettings = Seq(
 lazy val root = project
   .in(file("."))
   .aggregate(core.projectRefs*)
-  .aggregate(docs.projectRefs*)
   .settings(noPublish)
+
+import com.indoorvivants.detective.Platform.OS.*
+import com.indoorvivants.detective.Platform
+import bindgen.interface.Binding
+import bindgen.interface.LogLevel
 
 lazy val core = projectMatrix
   .in(file("modules/core"))
@@ -62,41 +64,57 @@ lazy val core = projectMatrix
     Test / scalacOptions ~= filterConsoleScalacOptions
   )
   .settings(munitSettings)
-  .jvmPlatform(Versions.scalaVersions)
-  .jsPlatform(Versions.scalaVersions, disableDependencyChecks)
   .nativePlatform(Versions.scalaVersions, disableDependencyChecks)
   .enablePlugins(BuildInfoPlugin)
   .settings(
-    buildInfoPackage := "com.indoorvivants.library.internal",
+    buildInfoPackage := "laska.internal",
     buildInfoKeys := Seq[BuildInfoKey](
       version,
       scalaVersion,
       scalaBinaryVersion
-    ),
-    scalaJSUseMainModuleInitializer := true,
-    scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule))
-  )
-
-lazy val docs = projectMatrix
-  .in(file("myproject-docs"))
-  .dependsOn(core)
-  .defaultAxes(defaults*)
-  .settings(
-    mdocVariables := Map(
-      "VERSION" -> version.value
     )
   )
-  .settings(disableDependencyChecks)
-  .jvmPlatform(Versions.scalaVersions)
-  .enablePlugins(MdocPlugin)
-  .settings(noPublish)
+  .enablePlugins(ScalaNativePlugin, BindgenPlugin, VcpkgPlugin)
+  .settings(
+    vcpkgDependencies := Set("lua"),
+    scalaVersion      := Versions.Scala3,
+    nativeConfig ~= (_.withIncrementalCompilation(true)),
+    bindgenBindings := {
+      Seq(
+        Binding(
+          (ThisBuild / baseDirectory).value / "modules" / "core" / "lua-amalgam.h",
+          "lua",
+          cImports = List("lua.h", "lauxlib.h", "lualib.h"),
+          clangFlags = List(
+            "-I" + vcpkgConfigurator.value.includes("lua").toString
+          )
+        )
+      )
+    }
+  )
+  .settings(vcpkgNativeConfig())
+
+/* lazy val docs = projectMatrix */
+/*   .in(file("myproject-docs")) */
+/*   .dependsOn(core) */
+/*   .defaultAxes(defaults*) */
+/*   .settings( */
+/*     mdocVariables := Map( */
+/*       "VERSION" -> version.value */
+/*     ) */
+/*   ) */
+/*   .settings(disableDependencyChecks) */
+/*   .jvmPlatform(Versions.scalaVersions) */
+/*   .enablePlugins(MdocPlugin) */
+/*   .settings(noPublish) */
 
 val noPublish = Seq(
   publish / skip      := true,
   publishLocal / skip := true
 )
 
-val defaults = Seq(VirtualAxis.scalaABIVersion("3.2.0"), VirtualAxis.jvm)
+val defaults =
+  Seq(VirtualAxis.scalaABIVersion(Versions.Scala3), VirtualAxis.jvm)
 
 val scalafixRules = Seq(
   "OrganizeImports",
@@ -130,3 +148,65 @@ val PrepareCICommands = Seq(
 addCommandAlias("ci", CICommands)
 
 addCommandAlias("preCI", PrepareCICommands)
+
+def vcpkgNativeConfig(rename: String => String = identity) = Seq(
+  nativeConfig := {
+    val configurator = vcpkgConfigurator.value
+    val conf         = nativeConfig.value
+    val deps         = vcpkgDependencies.value.toSeq.map(rename)
+
+    val files = deps.map(d => configurator.files(d))
+
+    val compileArgsApprox = files.flatMap { f =>
+      List("-I" + f.includeDir.toString)
+    }
+    val linkingArgsApprox = files.flatMap { f =>
+      List("-L" + f.libDir) ++ f.staticLibraries.map(_.toString)
+    }
+
+    import scala.util.control.NonFatal
+
+    def updateLinkingFlags(current: Seq[String], deps: String*) =
+      try {
+        configurator.pkgConfig.updateLinkingFlags(
+          current,
+          deps*
+        )
+      } catch {
+        case NonFatal(exc) =>
+          linkingArgsApprox
+      }
+
+    def updateCompilationFlags(current: Seq[String], deps: String*) =
+      try {
+        configurator.pkgConfig.updateCompilationFlags(
+          current,
+          deps*
+        )
+      } catch {
+        case NonFatal(exc) =>
+          compileArgsApprox
+      }
+
+    val arch64 =
+      if (
+        Platform.arch == Platform.Arch.Arm && Platform.bits == Platform.Bits.x64
+      )
+        List("-arch", "arm64")
+      else Nil
+
+    conf
+      .withLinkingOptions(
+        updateLinkingFlags(
+          conf.linkingOptions ++ arch64,
+          deps*
+        )
+      )
+      .withCompileOptions(
+        updateCompilationFlags(
+          conf.compileOptions ++ arch64,
+          deps*
+        )
+      )
+  }
+)
